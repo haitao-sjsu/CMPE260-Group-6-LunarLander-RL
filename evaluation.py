@@ -220,34 +220,3 @@ def evaluate_policy(
         )
 
     return metrics
-
-import gymnasium as gym
-
-env = gym.make("LunarLander-v3")
-
-def random_policy(obs):
-    # `obs` is required by the interface but not used here.
-    return env.action_space.sample()
-
-metrics_random = evaluate_policy(env, random_policy, num_episodes=100, seed=0)
-print("Random policy metrics:")
-for k, v in metrics_random.items():
-    print(f"{k}: {v}")
-
-env.close()
-
-import gymnasium as gym
-from gymnasium.envs.box2d.lunar_lander import heuristic
-
-env = gym.make("LunarLander-v3")
-
-def heuristic_policy(obs):
-    # Use the official heuristic controller provided by Gymnasium.
-    return heuristic(env, obs)
-
-metrics_heuristic = evaluate_policy(env, heuristic_policy, num_episodes=100, seed=0)
-print("Heuristic policy metrics:")
-for k, v in metrics_heuristic.items():
-    print(f"{k}: {v}")
-
-env.close()
