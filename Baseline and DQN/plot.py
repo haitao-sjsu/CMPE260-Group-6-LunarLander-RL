@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import List
 
-from DQN import ExperimentResult
+from config import ExperimentResult
 
 def plot_avg_return(results: List[ExperimentResult]):
     """Plot moving-average return curves for one or more experiments.
@@ -33,3 +33,22 @@ def plot_avg_return(results: List[ExperimentResult]):
     plt.tight_layout()
     plt.show()
 
+def plot_avg_loss(result: ExperimentResult):
+    WINDOW = 1000
+    plt.figure(figsize=(8, 5))
+
+    weights = np.ones(WINDOW) / WINDOW
+    moving_avg_loss = np.convolve(result.losses, weights, mode='valid')
+    
+    steps = range(len(moving_avg_loss))
+    label = f"{result.variant}"
+    plt.plot(steps, moving_avg_loss, label=label)
+
+    plt.xlabel("Step")
+    plt.ylabel(f"Moving average loss (window={WINDOW})")
+    plt.title("Average loss curves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    

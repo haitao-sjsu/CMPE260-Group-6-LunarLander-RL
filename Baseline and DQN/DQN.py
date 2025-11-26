@@ -1,5 +1,4 @@
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 
 import random
 import numpy as np
@@ -7,83 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tqdm import tqdm
-
-import gymnasium as gym
-
-
-# ----------------------
-# Config
-# ----------------------
-
-
-@dataclass
-class DQNConfig:
-    """Configuration for DQN and its variants.
-
-    This is shared across different experiments so we can easily tweak
-    hyperparameters like LR, HIDDEN_SIZES, etc.
-    """
-
-    # Reproducibility
-    SEED: int = 42
-
-    # Discounting
-    GAMMA: float = 0.99
-
-    # Optimization
-    LR: float = 5e-4
-    GRAD_CLIP_NORM: float = 10.0
-
-    # Replay Buffer
-    CAPACITY: int = 100_000
-    TRAIN_START_SIZE: int = 1_000
-
-    # Training Loop
-    BATCH_SIZE: int = 64
-    TARGET_UPDATE_FREQ: int = 1_000  # in environment steps
-    MAX_ENV_STEPS: int = 300_000
-
-    # Exploration: epsilon-greedy
-    EPS_START: float = 1.0
-    EPS_END: float = 0.05
-    EPS_DECAY_STEPS: int = 100_000
-
-    # Exploration: Boltzmann (optional)
-    T_START: float = 1.0
-    T_END: float = 0.05
-    T_DECAY_STEPS: int = 100_000
-
-    # Network Architecture
-    HIDDEN_SIZES: Tuple[int, int] = (64, 64)
-
-    #
-    WINDOW: int = 20
-    SOLVE_AT: int = 200
-    PRINT_EVERY: int = 100
-
-# ----------------------
-# Experiment result structure
-# ----------------------
-
-
-@dataclass
-class ExperimentResult:
-    """Container for logging training statistics.
-
-    This makes it easy to compare different algorithms / hyperparameters
-    and to plot learning curves later.
-    """
-
-    config: DQNConfig
-    variant: str
-    episode_lengths: List[int]
-    returns: List[float]
-    losses: List[float]
-    grad_norms: List[float]
-    q_means: List[float]
-    q_stds: List[float]
-
+from config import DQNConfig
 
 # ----------------------
 # Replay Buffer
@@ -297,6 +220,10 @@ class BaseDQNAgent:
             y = R + self.config.GAMMA * (1.0 - D) * max_next
         return y
 
+    def target_network_update_(self, global_step):
+        if global_step % self.config.TARGET_UPDATE_FREQ == 0:
+            self.q_target.load_state_dict(self.q_online.state_dict())
+
     def update(self, global_step: int) -> Optional[Tuple[float, float, float, float]]:
         """Sample a batch from replay and perform one gradient step.
 
@@ -326,8 +253,7 @@ class BaseDQNAgent:
         self.optimizer.step()
 
         # Hard update target network
-        if global_step % cfg.TARGET_UPDATE_FREQ == 0:
-            self.q_target.load_state_dict(self.q_online.state_dict())
+        self.target_network_update_(global_step)
 
         # Some statistics for logging
         with torch.no_grad():
@@ -389,7 +315,7 @@ class DoubleDQNAgent(BaseDQNAgent):
 
         return y
 
-
+            
 class DuelingDQNAgent(BaseDQNAgent):
     """Dueling DQN: replace online/target networks with dueling heads.
     Training loop, replay, target updates, and targets stay the same.
@@ -413,121 +339,3 @@ class DuelingDQNAgent(BaseDQNAgent):
         self.q_target.load_state_dict(self.q_online.state_dict())
         self.q_target.eval()
         self.optimizer = torch.optim.Adam(self.q_online.parameters(), lr=config.LR)
-
-
-
-# ----------------------
-# Training loop (no main, to be called from notebook)
-# ----------------------
-
-
-def train_loop(
-    config: DQNConfig,
-    *,
-    exploration: str = "epsilon",  # "epsilon" | "boltzmann" | "none"
-    variant: str = "dqn",          # just a label for logging (e.g. "dqn", "double", "dueling")
-) -> Tuple[ExperimentResult, BaseDQNAgent]:
-    """Main training loop for DQN on a Gymnasium environment.
-
-    This version always uses experience replay and a target network.
-    It logs several statistics that will be useful for later analysis
-    and visualization in your project.
-    """
-
-    # Set seeds for reproducibility
-    random.seed(config.SEED)
-    np.random.seed(config.SEED)
-    torch.manual_seed(config.SEED)
-
-    env = gym.make("LunarLander-v3")
-
-    # Initialize environment
-    s, _ = env.reset(seed=config.SEED)
-    episode_return = 0.0
-    episode_len = 0
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    obs_dim = env.observation_space.shape[0]
-    n_actions = env.action_space.n
-
-    # Choose agent class based on variant label. This makes it easy to
-    # swap in DoubleDQNAgent or DuelingDQNAgent later.
-    if variant.lower() == "dqn":
-        agent_cls = DQNAgent
-    elif variant.lower() == "double":
-        agent_cls = DoubleDQNAgent
-    elif variant.lower() == "dueling":
-        agent_cls = DuelingDQNAgent
-    else:
-        # Fallback to standard DQN if an unknown variant is passed.
-        agent_cls = DQNAgent
-    
-    agent = agent_cls(obs_dim, n_actions, config, device=device)
-
-    episode_lengths: List[int] = []
-    returns: List[float] = []
-    losses: List[float] = []
-    grad_norms: List[float] = []
-    q_means: List[float] = []
-    q_stds: List[float] = []
-
-    for global_step in tqdm(range(1, config.MAX_ENV_STEPS + 1)):
-        # 1) Select action with exploration
-        a = agent.select_action(s, global_step, exploration=exploration)
-
-        # 2) Step environment
-        s_next, r, terminated, truncated, info = env.step(a)
-        done = bool(terminated or truncated)
-
-        # 3) Store transition in replay buffer
-        agent.replay.add(s.astype(np.float32), a, float(r), s_next.astype(np.float32), done)
-
-        # 4) Accumulate return and length
-        episode_return += r
-        episode_len += 1
-
-        # 5) DQN update (if enough data collected)
-        update_info = agent.update(global_step)
-        if update_info is not None:
-            loss, grad_norm, q_mean, q_std = update_info
-            losses.append(loss)
-            grad_norms.append(grad_norm)
-            q_means.append(q_mean)
-            q_stds.append(q_std)
-
-        # 6) Episode end handling
-        if done:
-            episode_lengths.append(episode_len)
-            returns.append(episode_return)
-
-            # Check whether the problem has been solved or not
-            # latest_avg_return = np.mean(returns[-1*config.WINDOW:])
-            # if latest_avg_return >= config.SOLVE_AT:
-            #     print(f"Problem solved at episode {len(returns)}")
-            #     break
-            ep = len(returns)
-            if ep % config.PRINT_EVERY == 0 or ep == 1:
-                latest_avg_return = np.mean(returns[-1*config.WINDOW:])
-                print(f"Episode: {ep:4d} | The latest {config.WINDOW} avg return: {latest_avg_return:5.2f}")
-            # If not, reset episode
-            s, _ = env.reset()
-            episode_return = 0.0
-            episode_len = 0
-        else:
-            s = s_next
-
-    env.close()
-
-    result = ExperimentResult(
-        config=config,
-        variant=variant,
-        returns=returns,
-        episode_lengths=episode_lengths,
-        losses=losses,
-        grad_norms=grad_norms,
-        q_means=q_means,
-        q_stds=q_stds,
-    )
-
-    return result, agent
