@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from tqdm import tqdm
+
 import gymnasium as gym
 
 
@@ -29,7 +32,7 @@ class DQNConfig:
     GAMMA: float = 0.99
 
     # Optimization
-    LR: float = 1e-4
+    LR: float = 5e-4
     GRAD_CLIP_NORM: float = 10.0
 
     # Replay Buffer
@@ -39,20 +42,47 @@ class DQNConfig:
     # Training Loop
     BATCH_SIZE: int = 64
     TARGET_UPDATE_FREQ: int = 1_000  # in environment steps
-    MAX_ENV_STEPS: int = 100_000
+    MAX_ENV_STEPS: int = 300_000
 
     # Exploration: epsilon-greedy
     EPS_START: float = 1.0
     EPS_END: float = 0.05
-    EPS_DECAY_STEPS: int = 50_000
+    EPS_DECAY_STEPS: int = 100_000
 
     # Exploration: Boltzmann (optional)
     T_START: float = 1.0
     T_END: float = 0.05
-    T_DECAY_STEPS: int = 50_000
+    T_DECAY_STEPS: int = 100_000
 
     # Network Architecture
-    HIDDEN_SIZES: Tuple[int, int] = (32, 32)
+    HIDDEN_SIZES: Tuple[int, int] = (64, 64)
+
+    #
+    WINDOW: int = 20
+    SOLVE_AT: int = 200
+    PRINT_EVERY: int = 100
+
+# ----------------------
+# Experiment result structure
+# ----------------------
+
+
+@dataclass
+class ExperimentResult:
+    """Container for logging training statistics.
+
+    This makes it easy to compare different algorithms / hyperparameters
+    and to plot learning curves later.
+    """
+
+    config: DQNConfig
+    variant: str
+    episode_lengths: List[int]
+    returns: List[float]
+    losses: List[float]
+    grad_norms: List[float]
+    q_means: List[float]
+    q_stds: List[float]
 
 
 # ----------------------
@@ -126,29 +156,33 @@ class QNetwork(nn.Module):
         return self.net(x)
 
 
-# ----------------------
-# Experiment result structure
-# ----------------------
+class DuelingQNetwork(nn.Module):
+    """Dueling architecture for discrete actions: shared torso + (Value, Advantage) heads."""
+    def __init__(self, obs_dim: int, n_actions: int, hidden_sizes: Tuple[int, int]):
+        super().__init__()
+        h1, h2 = hidden_sizes
 
+        # Shared feature extractor
+        self.feature = nn.Sequential(
+            nn.Linear(obs_dim, h1),
+            nn.ReLU(),
+            nn.Linear(h1, h2),
+            nn.ReLU(),
+        )
 
-@dataclass
-class ExperimentResult:
-    """Container for logging training statistics.
+        # Value and Advantage heads
+        self.value = nn.Linear(h2, 1)
+        self.advantage = nn.Linear(h2, n_actions)
 
-    This makes it easy to compare different algorithms / hyperparameters
-    and to plot learning curves later.
-    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.feature(x)                      # (batch, h2)
+        v = self.value(z)                        # (batch, 1)
+        a = self.advantage(z)                    # (batch, n_actions)
 
-    config: DQNConfig
-    variant: str
-    episode_lengths: List[int]
-    returns: List[float]
-    moving_avg_returns: List[float]
-    losses: List[float]
-    grad_norms: List[float]
-    q_means: List[float]
-    q_stds: List[float]
-    steps_to_200: Optional[int]
+        # Subtract mean advantage for identifiability/stability
+        a_mean = a.mean(dim=1, keepdim=True)     # (batch, 1)
+        q = v + (a - a_mean)                     # (batch, n_actions)
+        return q
 
 
 # ----------------------
@@ -235,7 +269,7 @@ class BaseDQNAgent:
         else:
             raise ValueError(f"Unknown exploration strategy: {exploration}")
 
-    def select_deterministic_action(self, s_np: np.ndarray) -> int:
+    def select_deterministic_action(self, env, s_np: np.ndarray) -> int:
         """Select a greedy action without exploration.
 
         This is intended for evaluation, where we typically want the
@@ -313,23 +347,52 @@ class DQNAgent(BaseDQNAgent):
 
 
 class DoubleDQNAgent(BaseDQNAgent):
-    """Skeleton for Double DQN agent.
+    """Double DQN agent.
 
-    For now, this behaves the same as standard DQN. To implement true
-    Double DQN, override `compute_targets` to use the online network
-    for action selection and the target network for evaluation.
+    Key idea:
+      - Use the *online* network to select the next action (argmax).
+      - Use the *target* network to evaluate that chosen action.
+    This decouples action selection from action evaluation and reduces
+    the overestimation bias present in standard DQN.
+
+    Target:
+      y = r + gamma * (1 - done) * Q_target(s', argmax_a Q_online(s', a))
     """
 
-    # TODO: override compute_targets for Double DQN behavior.
-    pass
+    def compute_targets(
+        self,
+        S_next: torch.Tensor,
+        R: torch.Tensor,
+        D: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute Double DQN bootstrap targets.
+
+        Args:
+            S_next: Next states, shape (batch, obs_dim).
+            R: Rewards, shape (batch,).
+            D: Done flags in {0,1}, shape (batch,).
+
+        Returns:
+            y: Target values for Q(s,a), shape (batch,).
+        """
+        with torch.no_grad():
+            # 1) Action selection with the *online* network: a* = argmax_a Q_online(s', a)
+            q_next_online = self.q_online(S_next)                      # (batch, n_actions)
+            next_actions = torch.argmax(q_next_online, dim=1, keepdim=True)  # (batch, 1)
+
+            # 2) Action evaluation with the *target* network: Q_target(s', a*)
+            q_next_target = self.q_target(S_next)                      # (batch, n_actions)
+            q_selected = q_next_target.gather(1, next_actions).squeeze(1)     # (batch,)
+
+            # 3) Double DQN target
+            y = R + self.config.GAMMA * (1.0 - D) * q_selected
+
+        return y
 
 
 class DuelingDQNAgent(BaseDQNAgent):
-    """Skeleton for Dueling DQN agent.
-
-    For now, this uses the same architecture as the base class. To
-    implement true Dueling DQN, replace `self.q_online` and
-    `self.q_target` with dueling-style networks in `__init__`.
+    """Dueling DQN: replace online/target networks with dueling heads.
+    Training loop, replay, target updates, and targets stay the same.
     """
 
     def __init__(
@@ -339,7 +402,18 @@ class DuelingDQNAgent(BaseDQNAgent):
         config: DQNConfig,
         device: Optional[torch.device] = None,
     ):
+        # Initialize everything as usual, then replace the networks and optimizer.
         super().__init__(obs_dim, n_actions, config, device=device)
+
+        # Swap in dueling networks
+        self.q_online = DuelingQNetwork(obs_dim, n_actions, config.HIDDEN_SIZES).to(self.device)
+        self.q_target = DuelingQNetwork(obs_dim, n_actions, config.HIDDEN_SIZES).to(self.device)
+
+        # Hard sync target and set optimizer on the new parameters
+        self.q_target.load_state_dict(self.q_online.state_dict())
+        self.q_target.eval()
+        self.optimizer = torch.optim.Adam(self.q_online.parameters(), lr=config.LR)
+
 
 
 # ----------------------
@@ -348,7 +422,6 @@ class DuelingDQNAgent(BaseDQNAgent):
 
 
 def train_loop(
-    env: gym.Env,
     config: DQNConfig,
     *,
     exploration: str = "epsilon",  # "epsilon" | "boltzmann" | "none"
@@ -365,8 +438,13 @@ def train_loop(
     random.seed(config.SEED)
     np.random.seed(config.SEED)
     torch.manual_seed(config.SEED)
-    if hasattr(env, "reset"):
-        env.reset(seed=config.SEED)
+
+    env = gym.make("LunarLander-v3")
+
+    # Initialize environment
+    s, _ = env.reset(seed=config.SEED)
+    episode_return = 0.0
+    episode_len = 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -376,7 +454,7 @@ def train_loop(
     # Choose agent class based on variant label. This makes it easy to
     # swap in DoubleDQNAgent or DuelingDQNAgent later.
     if variant.lower() == "dqn":
-        agent_cls: Type[BaseDQNAgent] = DQNAgent
+        agent_cls = DQNAgent
     elif variant.lower() == "double":
         agent_cls = DoubleDQNAgent
     elif variant.lower() == "dueling":
@@ -389,24 +467,12 @@ def train_loop(
 
     episode_lengths: List[int] = []
     returns: List[float] = []
-    moving_avg_returns: List[float] = []
     losses: List[float] = []
     grad_norms: List[float] = []
     q_means: List[float] = []
     q_stds: List[float] = []
 
-    # For moving average and steps-to-200
-    from collections import deque
-
-    window = deque(maxlen=100)
-    steps_to_200: Optional[int] = None
-
-    # Initialize environment
-    s, _ = env.reset(seed=config.SEED)
-    episode_return = 0.0
-    episode_len = 0
-
-    for global_step in range(1, config.MAX_ENV_STEPS + 1):
+    for global_step in tqdm(range(1, config.MAX_ENV_STEPS + 1)):
         # 1) Select action with exploration
         a = agent.select_action(s, global_step, exploration=exploration)
 
@@ -434,32 +500,34 @@ def train_loop(
         if done:
             episode_lengths.append(episode_len)
             returns.append(episode_return)
-            window.append(episode_return)
-            moving_avg_returns.append(float(np.mean(window)))
 
-            # Check if we have solved the task (avg return >= 200 over last 100 eps)
-            if len(window) == 100 and steps_to_200 is None:
-                if np.mean(window) >= 200.0:
-                    steps_to_200 = global_step
-
-            # Reset episode
+            # Check whether the problem has been solved or not
+            # latest_avg_return = np.mean(returns[-1*config.WINDOW:])
+            # if latest_avg_return >= config.SOLVE_AT:
+            #     print(f"Problem solved at episode {len(returns)}")
+            #     break
+            ep = len(returns)
+            if ep % config.PRINT_EVERY == 0 or ep == 1:
+                latest_avg_return = np.mean(returns[-1*config.WINDOW:])
+                print(f"Episode: {ep:4d} | The latest {config.WINDOW} avg return: {latest_avg_return:5.2f}")
+            # If not, reset episode
             s, _ = env.reset()
             episode_return = 0.0
             episode_len = 0
         else:
             s = s_next
 
+    env.close()
+
     result = ExperimentResult(
         config=config,
         variant=variant,
         returns=returns,
         episode_lengths=episode_lengths,
-        moving_avg_returns=moving_avg_returns,
         losses=losses,
         grad_norms=grad_norms,
         q_means=q_means,
         q_stds=q_stds,
-        steps_to_200=steps_to_200,
     )
 
     return result, agent
