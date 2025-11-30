@@ -32,7 +32,6 @@ class DQNConfig:
     BATCH_SIZE: int = 128
     TARGET_UPDATE_FREQ: int = 1_000  # in environment steps
     MAX_ENV_STEPS: int = 500_000
-    TAU = 0.01
 
     # Exploration: epsilon-greedy
     EPS_START: float = 1.0
